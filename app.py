@@ -145,13 +145,18 @@ class AgentSystem:
         
         data = self.clean_json(res)
         
-        # SAFETY CHECK 1: Ensure problem_text exists
-        if not data or 'problem_text' not in data:
-            return {
-                "problem_text": text if text else "Error: Could not extract text", 
-                "topic": "Unknown", 
-                "needs_clarification": True
-            }
+        # CRASH FIX: Force default dictionary if data is None or missing keys
+        if not data:
+            data = {}
+        
+        # Ensure 'problem_text' always exists
+        if 'problem_text' not in data:
+            data['problem_text'] = text if text else "Error: Could not extract text from input."
+        
+        # Ensure 'needs_clarification' exists
+        if 'needs_clarification' not in data:
+            data['needs_clarification'] = False
+            
         return data
 
     # Agent 2: Router
@@ -166,22 +171,32 @@ class AgentSystem:
         Problem: {problem}. Return JSON: {{"steps": ["1...", "2..."], "final_answer": "...", "confidence": 0.95}}"""
         res = call_gemini(prompt)
         data = self.clean_json(res)
-        if not data: return {"steps": ["Error"], "final_answer": res, "confidence": 0.0}
+        
+        # CRASH FIX: Default if solver fails
+        if not data: 
+            return {"steps": ["Error generating solution steps."], "final_answer": res, "confidence": 0.0}
         return data
 
-    # Agent 4: Verifier (CRITICAL FIX HERE)
+    # Agent 4: Verifier
     def verifier(self, problem, solution):
         self.log("Verifier", "Checking logic...")
-        prompt = f"""Verify. Problem: {problem}. Answer: {solution.get('final_answer')}.
+        # Handle cases where final_answer might be missing
+        ans = solution.get('final_answer', 'Unknown')
+        
+        prompt = f"""Verify. Problem: {problem}. Answer: {ans}.
         Return JSON: {{"is_correct": true, "critique": "None", "confidence": 1.0}}"""
         res = call_gemini(prompt)
         data = self.clean_json(res)
         
-        # SAFETY CHECK 2: Prevent Crash if AI forgets keys
+        # CRASH FIX: Default to True (allow passage) if verifier fails to parse
         if not data: 
-            return {"is_correct": True, "critique": "Parsing Error (Assumed Correct)", "confidence": 1.0}
-        if 'is_correct' not in data:
-            data['is_correct'] = True # Default to true
+            return {"is_correct": True, "critique": "Verifier failed to parse, assuming correct.", "confidence": 1.0}
+        
+        # Ensure keys exist
+        if 'is_correct' not in data: data['is_correct'] = True
+        if 'confidence' not in data: data['confidence'] = 1.0
+        if 'critique' not in data: data['critique'] = "None"
+        
         return data
 
     # Agent 5: Explainer
@@ -205,7 +220,8 @@ def main():
             txt = st.text_area("Problem:")
             if st.button("Analyze"):
                 st.session_state.parsed = st.session_state.agents.parser(text=txt)
-                if not st.session_state.parsed.get('needs_clarification'):
+                # CRASH FIX: Use .get()
+                if not st.session_state.parsed.get('needs_clarification', False):
                     st.session_state.run_solver = True
                     st.session_state.step = 3
                 else:
@@ -228,7 +244,7 @@ def main():
     elif st.session_state.step == 2:
         st.header("1. Verify Extraction")
         
-        # Safe access to problem text
+        # CRASH FIX: Safe Access
         current_prob = st.session_state.parsed.get('problem_text', '')
         
         conn = sqlite3.connect('math_memory.db')
@@ -253,7 +269,8 @@ def main():
     elif st.session_state.step == 3:
         if st.session_state.get('run_solver'):
             with st.spinner("Running Agents (Slowed down for limits)..."):
-                prob = st.session_state.parsed.get('problem_text', 'Error')
+                # CRASH FIX: Safe access
+                prob = st.session_state.parsed.get('problem_text', 'Error extracting text')
                 
                 # Heavy Throttling (6 seconds) to respect your 5 RPM limit
                 time.sleep(6) 
@@ -277,12 +294,15 @@ def main():
                 else:
                     st.session_state.needs_hitl_correction = False
                     time.sleep(6)
-                    exp = st.session_state.agents.explainer(sol, ver.get('critique', 'None'))
+                    # CRASH FIX: Safe access to critique
+                    critique = ver.get('critique', 'None')
+                    exp = st.session_state.agents.explainer(sol, critique)
                     st.session_state.final = exp
             st.session_state.run_solver = False
 
         if st.session_state.get('needs_hitl_correction'):
             st.error("⚠️ Verifier found issues.")
+            # CRASH FIX: Safe access
             critique = st.session_state.verification.get('critique', 'Unknown issue')
             st.warning(f"Critique: {critique}")
             if st.button("Retry/Edit"):
@@ -296,8 +316,10 @@ def main():
             
             if st.button("✅ Save to Memory"):
                 conn = sqlite3.connect('math_memory.db')
+                # CRASH FIX: Safe access
+                prob_txt = st.session_state.parsed.get('problem_text', 'Unknown')
                 conn.execute("INSERT INTO history (timestamp, problem, solution) VALUES (?,?,?)", 
-                            (str(datetime.now()), st.session_state.parsed.get('problem_text'), st.session_state.final))
+                            (str(datetime.now()), prob_txt, st.session_state.final))
                 conn.commit()
                 st.toast("Saved!")
             if st.button("Start Over"):

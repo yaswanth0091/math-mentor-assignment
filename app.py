@@ -47,7 +47,7 @@ with st.sidebar:
     st.divider()
     st.header("🕵️ Agent Trace")
 
-# --- 3. DIRECT API HELPER (With Backoff) ---
+# --- 3. DIRECT API HELPER (With Heavy Backoff) ---
 def call_gemini(prompt, image_data=None, mime_type=None):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{CURRENT_MODEL}:generateContent?key={API_KEY}"
     headers = {'Content-Type': 'application/json'}
@@ -255,7 +255,7 @@ def main():
             with st.spinner("Running Agents (Slowed down for limits)..."):
                 prob = st.session_state.parsed.get('problem_text', 'Error')
                 
-                # Heavy Throttling
+                # Heavy Throttling (6 seconds) to respect your 5 RPM limit
                 time.sleep(6) 
                 topic = st.session_state.agents.router(prob)
                 ctx = retrieve(prob)

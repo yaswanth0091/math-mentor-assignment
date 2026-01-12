@@ -141,12 +141,11 @@ class AgentSystem:
         try: return json.loads(text.replace('```json', '').replace('```', '').strip())
         except: return None
 
-    # Agent 1: Parser
+   # Agent 1: Parser (Safety Update)
     def parser(self, text=None, img=None, audio=None):
         self.log("Parser", "Analyzing input...")
         prompt = """
-        Extract the math problem. If text is clear math, set "needs_clarification": false.
-        Return JSON: {"problem_text": "...", "topic": "math", "needs_clarification": false}
+        Extract the math problem. Return JSON: {"problem_text": "...", "topic": "math", "needs_clarification": false}
         """
         if img:
             b64 = base64.b64encode(img).decode()
@@ -158,7 +157,17 @@ class AgentSystem:
             res = call_gemini(f"{prompt} Input: {text}")
         
         data = self.clean_json(res)
-        if not data: return {"problem_text": text or "Error", "topic": "Unknown", "needs_clarification": True}
+        
+        # --- SAFETY FIX STARTS HERE ---
+        # If data is None (API failure) OR if the AI forgot the 'problem_text' key
+        if not data or 'problem_text' not in data:
+            return {
+                "problem_text": text if text else "Error: Could not extract text", 
+                "topic": "Unknown", 
+                "needs_clarification": True
+            }
+        # --- SAFETY FIX ENDS HERE ---
+        
         return data
 
     # Agent 2: Router

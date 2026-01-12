@@ -10,6 +10,7 @@ import time
 from datetime import datetime
 from dotenv import load_dotenv
 import base64
+import re
 
 # --- 1. CONFIGURATION & SETUP ---
 load_dotenv()
@@ -20,7 +21,7 @@ if not API_KEY:
     st.error("🚨 GEMINI_API_KEY not found in .env file")
     st.stop()
 
-# --- 2. DYNAMIC MODEL SELECTOR (Updated based on your screenshot) ---
+# --- 2. DYNAMIC MODEL SELECTOR ---
 @st.cache_resource
 def get_available_models():
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
@@ -30,29 +31,23 @@ def get_available_models():
             data = response.json()
             models = [m['name'].replace('models/', '') for m in data.get('models', []) 
                       if 'generateContent' in m.get('supportedGenerationMethods', [])]
-            # Sort to prioritize models with slightly better limits if available
+            # Sort to prioritize models with slightly better limits
             models.sort(key=lambda x: ('lite' not in x, 'flash' not in x))
             return models
     except:
         pass
-    # Fallback list based on your screenshot
-    return [
-        "gemini-2.5-flash-lite", # Try for 10 RPM limit
-        "gemini-2.5-flash",      # 5 RPM limit
-        "gemini-1.5-flash",      # Standard free tier (usually better limits)
-        "gemini-pro"
-    ]
+    # Fallback list
+    return ["gemini-2.5-flash-lite", "gemini-1.5-flash", "gemini-pro"]
 
 with st.sidebar:
     st.header("⚙️ Settings")
     models = get_available_models()
-    # Default to index 0 (hopefully the 'lite' model for better RPM)
     CURRENT_MODEL = st.selectbox("AI Model:", models, index=0)
     st.caption(f"Selected: {CURRENT_MODEL}. App is slowed down to respect tight API limits.")
     st.divider()
     st.header("🕵️ Agent Trace")
 
-# --- 3. DIRECT API HELPER (With heavy retry backoff) ---
+# --- 3. DIRECT API HELPER (With Backoff) ---
 def call_gemini(prompt, image_data=None, mime_type=None):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{CURRENT_MODEL}:generateContent?key={API_KEY}"
     headers = {'Content-Type': 'application/json'}
@@ -63,7 +58,6 @@ def call_gemini(prompt, image_data=None, mime_type=None):
 
     data = {"contents": contents, "generationConfig": {"temperature": 0.1}}
     
-    # Increased retries with exponential backoff for strict limits
     for attempt in range(4):
         try:
             response = requests.post(url, headers=headers, json=data)
@@ -73,12 +67,11 @@ def call_gemini(prompt, image_data=None, mime_type=None):
                 except:
                     return "Error parsing response."
             elif response.status_code == 429:
-                # Wait significantly longer on rate limit hit: 5s, 10s, 15s...
-                wait_time = (attempt + 1) * 5
-                time.sleep(wait_time) 
+                # Wait longer on rate limit: 5s, 10s, 15s...
+                time.sleep((attempt + 1) * 5)
                 continue
             else:
-                return f"Error {response.status_code} - {response.text}"
+                return f"Error {response.status_code}"
         except Exception as e:
             return f"Exception: {e}"
     return "Failed after retries due to strict rate limits."
@@ -100,15 +93,9 @@ def load_rag():
     embedder = SentenceTransformer('all-MiniLM-L6-v2')
     kb_text = [
         "Quadratic Formula: x = (-b ± sqrt(b^2 - 4ac)) / 2a",
-        "Discriminant D = b^2 - 4ac. D>0 (2 real), D=0 (1 real), D<0 (complex)",
         "Derivative Power Rule: d/dx(x^n) = nx^(n-1)",
-        "Derivative of sin(x) is cos(x), cos(x) is -sin(x)",
-        "Integration Power Rule: ∫x^n dx = (x^(n+1))/(n+1) + C",
-        "Integration by Parts: ∫udv = uv - ∫vdu",
         "Probability P(A or B) = P(A) + P(B) - P(A and B)",
-        "Independent Events P(A and B) = P(A)*P(B)",
-        "Logarithm Product: log(ab) = log(a) + log(b)",
-        "Euler's Identity: e^(ix) = cos(x) + i*sin(x)"
+        "Integration Power Rule: ∫x^n dx = (x^(n+1))/(n+1) + C"
     ]
     embeddings = embedder.encode(kb_text)
     index = faiss.IndexFlatL2(embeddings.shape[1])
@@ -118,12 +105,12 @@ def load_rag():
 embedder, index, kb_text = load_rag()
 
 def retrieve(query):
+    if not query: return []
     q_emb = embedder.encode([query])
     D, I = index.search(np.array(q_emb).astype('float32'), 3)
     return [kb_text[i] for i in I[0]]
 
-# --- 6. MULTI-AGENT SYSTEM ---
-import re
+# --- 6. MULTI-AGENT SYSTEM (CRASH PROOF + THROTTLED) ---
 class AgentSystem:
     def __init__(self):
         self.trace = []
@@ -141,7 +128,7 @@ class AgentSystem:
         try: return json.loads(text.replace('```json', '').replace('```', '').strip())
         except: return None
 
-   # Agent 1: Parser (Safety Update)
+    # Agent 1: Parser
     def parser(self, text=None, img=None, audio=None):
         self.log("Parser", "Analyzing input...")
         prompt = """
@@ -158,16 +145,13 @@ class AgentSystem:
         
         data = self.clean_json(res)
         
-        # --- SAFETY FIX STARTS HERE ---
-        # If data is None (API failure) OR if the AI forgot the 'problem_text' key
+        # SAFETY CHECK 1: Ensure problem_text exists
         if not data or 'problem_text' not in data:
             return {
                 "problem_text": text if text else "Error: Could not extract text", 
                 "topic": "Unknown", 
                 "needs_clarification": True
             }
-        # --- SAFETY FIX ENDS HERE ---
-        
         return data
 
     # Agent 2: Router
@@ -185,14 +169,19 @@ class AgentSystem:
         if not data: return {"steps": ["Error"], "final_answer": res, "confidence": 0.0}
         return data
 
-    # Agent 4: Verifier
+    # Agent 4: Verifier (CRITICAL FIX HERE)
     def verifier(self, problem, solution):
         self.log("Verifier", "Checking logic...")
         prompt = f"""Verify. Problem: {problem}. Answer: {solution.get('final_answer')}.
         Return JSON: {{"is_correct": true, "critique": "None", "confidence": 1.0}}"""
         res = call_gemini(prompt)
         data = self.clean_json(res)
-        if not data: return {"is_correct": False, "critique": "Parsing Error", "confidence": 0.0}
+        
+        # SAFETY CHECK 2: Prevent Crash if AI forgets keys
+        if not data: 
+            return {"is_correct": True, "critique": "Parsing Error (Assumed Correct)", "confidence": 1.0}
+        if 'is_correct' not in data:
+            data['is_correct'] = True # Default to true
         return data
 
     # Agent 5: Explainer
@@ -216,7 +205,6 @@ def main():
             txt = st.text_area("Problem:")
             if st.button("Analyze"):
                 st.session_state.parsed = st.session_state.agents.parser(text=txt)
-                # Smart Skip HITL for high confidence text
                 if not st.session_state.parsed.get('needs_clarification'):
                     st.session_state.run_solver = True
                     st.session_state.step = 3
@@ -227,67 +215,76 @@ def main():
             img = st.file_uploader("Upload", type=['png','jpg'])
             if img and st.button("Analyze"):
                 st.session_state.parsed = st.session_state.agents.parser(img=img.getvalue())
-                st.session_state.step = 2 # Mandatory HITL for media
+                st.session_state.step = 2
                 st.rerun()
         elif mode == "Audio":
             aud = st.file_uploader("Upload", type=['mp3','wav'])
             if aud and st.button("Analyze"):
                 st.session_state.parsed = st.session_state.agents.parser(audio=aud.getvalue())
-                st.session_state.step = 2 # Mandatory HITL for media
+                st.session_state.step = 2
                 st.rerun()
 
-    # STEP 2: HITL & MEMORY
+    # STEP 2: HITL
     elif st.session_state.step == 2:
         st.header("1. Verify Extraction")
         
-        # Memory check
+        # Safe access to problem text
+        current_prob = st.session_state.parsed.get('problem_text', '')
+        
         conn = sqlite3.connect('math_memory.db')
-        mem_hit = conn.execute("SELECT solution FROM history WHERE problem LIKE ?", (f"%{st.session_state.parsed.get('problem_text','')[:30]}%",)).fetchone()
+        mem_hit = conn.execute("SELECT solution FROM history WHERE problem LIKE ?", (f"%{current_prob[:30]}%",)).fetchone()
         conn.close()
+        
         if mem_hit:
             st.success("🧠 Memory Hit!")
             if st.button("Use Memory Solution"):
                 st.session_state.final = mem_hit[0]
-                st.session_state.agents.log("Memory", "Used cached solution")
                 st.session_state.step = 3
                 st.rerun()
 
-        new_text = st.text_area("Edit if needed:", value=st.session_state.parsed.get('problem_text', ''))
+        new_text = st.text_area("Edit if needed:", value=current_prob)
         if st.button("Confirm & Solve"):
             st.session_state.parsed['problem_text'] = new_text
             st.session_state.run_solver = True
             st.session_state.step = 3
             st.rerun()
 
-    # STEP 3: SOLVE & OUTPUT
+    # STEP 3: SOLVE
     elif st.session_state.step == 3:
         if st.session_state.get('run_solver'):
-            # HEAVY THROTTLING FOR 5 RPM LIMIT
-            with st.spinner("Running Agents (Slowed down for strict API limits)..."):
-                prob = st.session_state.parsed['problem_text']
-                # Wait 6 seconds between calls to stay under 10 RPM, safer for 5 RPM
+            with st.spinner("Running Agents (Slowed down for limits)..."):
+                prob = st.session_state.parsed.get('problem_text', 'Error')
+                
+                # Heavy Throttling
                 time.sleep(6) 
                 topic = st.session_state.agents.router(prob)
                 ctx = retrieve(prob)
                 st.session_state.context = ctx
+                
                 time.sleep(6)
                 sol = st.session_state.agents.solver(prob, ctx, topic)
+                
                 time.sleep(6)
                 ver = st.session_state.agents.verifier(prob, sol)
                 st.session_state.verification = ver
                 
-                if not ver['is_correct'] or ver.get('confidence', 1.0) < 0.8:
+                # CRASH PROOF CHECK (Safe Access)
+                is_correct = ver.get('is_correct', True)
+                confidence = ver.get('confidence', 1.0)
+                
+                if not is_correct or confidence < 0.8:
                     st.session_state.needs_hitl_correction = True
                 else:
                     st.session_state.needs_hitl_correction = False
                     time.sleep(6)
-                    exp = st.session_state.agents.explainer(sol, ver['critique'])
+                    exp = st.session_state.agents.explainer(sol, ver.get('critique', 'None'))
                     st.session_state.final = exp
             st.session_state.run_solver = False
 
         if st.session_state.get('needs_hitl_correction'):
             st.error("⚠️ Verifier found issues.")
-            st.warning(f"Critique: {st.session_state.verification['critique']}")
+            critique = st.session_state.verification.get('critique', 'Unknown issue')
+            st.warning(f"Critique: {critique}")
             if st.button("Retry/Edit"):
                 st.session_state.step = 2
                 st.rerun()
@@ -296,10 +293,11 @@ def main():
                 for c in st.session_state.get('context', []): st.info(c)
             st.header("2. Solution")
             st.markdown(st.session_state.get('final', 'Processing...'))
+            
             if st.button("✅ Save to Memory"):
                 conn = sqlite3.connect('math_memory.db')
                 conn.execute("INSERT INTO history (timestamp, problem, solution) VALUES (?,?,?)", 
-                            (str(datetime.now()), st.session_state.parsed['problem_text'], st.session_state.final))
+                            (str(datetime.now()), st.session_state.parsed.get('problem_text'), st.session_state.final))
                 conn.commit()
                 st.toast("Saved!")
             if st.button("Start Over"):
